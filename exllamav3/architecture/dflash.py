@@ -1,0 +1,315 @@
+from __future__ import annotations
+from typing_extensions import override
+import torch
+
+from ..cache import Cache
+from ..model.config import Config, no_default
+from ..model.model import Model
+from ..util.rope import RopeStyle
+from ..modules import RMSNorm, TransformerBlock, Attention, GatedMLP
+from ..modules.arch_specific.dflash import DFlashInputLayer
+from ..modules.attn import prepare_for_attn
+from ..modules.module import no_p2p_copy
+import weakref
+
+from ..util.tensor import get_for_device
+
+# TODO: Support DFlash models trained in Speculators (includes lm_head for speculator with limited vocabulary?)
+
+class DFlashConfig(Config):
+    arch_string = "DFlashDraftModel"
+
+    # Offset from the checkpoint's target_layer_ids to exllamav3 export indices (which denote the
+    # OUTPUT of layer j). The original DFlash release needs +1 (determined empirically); variants
+    # whose reference uses hidden_states[i + 1] (output of layer i) use raw ids
+    tap_shift = 1
+
+    def __init__(
+        self,
+        directory: str,
+        model_classes: dict | None = None,
+        **kwargs,
+    ):
+        super().__init__(
+            directory,
+            model_classes or {"text": DFlashModel},
+            **kwargs
+        )
+
+        # Attention params
+        self.head_dim = self.read_cfg(int, "head_dim", None)
+        self.hidden_size = self.read_cfg(int, "hidden_size", no_default)
+        self.num_q_heads = self.read_cfg(int, "num_attention_heads", no_default)
+        self.num_kv_heads = self.read_cfg(int, "num_key_value_heads", self.num_q_heads)
+
+        if not self.head_dim:
+            self.head_dim = self.hidden_size // self.num_q_heads
+
+        # MLP params
+        self.assert_cfg(str, "hidden_act", "silu", True)
+        self.intermediate_size = self.read_cfg(int, "intermediate_size", no_default)
+
+        # Norms
+        self.rms_norm_eps = self.read_cfg(float, "rms_norm_eps", no_default)
+
+        # Layers
+        self.num_hidden_layers = self.read_cfg(int, "num_hidden_layers", no_default)
+        # self.num_target_layers = self.read_cfg(int, "num_target_layers", no_default)
+        self.layer_types = self.read_cfg(list, "layer_types", ["full_attention"] * self.num_hidden_layers)
+        self.sliding_window = self.read_cfg(int, "sliding_window", 2048)
+
+        # DFlash. Config keys live under dflash_config-> in the original release, at the top
+        # level in later ones (MuseGlimmerAssistant)
+        self.mask_token_id = self.read_cfg(int, ["dflash_config->mask_token_id", "mask_token_id"], no_default)
+        self.target_layer_ids = self.read_cfg(list, ["dflash_config->target_layer_ids", "target_layer_ids"], no_default)
+        self.target_layer_ids = [i + self.tap_shift for i in self.target_layer_ids]
+        self.block_size = self.read_cfg(int, ["block_size", "dflash_config->block_size"], no_default)
+
+        # RoPE
+        self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
+
+        # Vision placeholders
+        self.vision = None
+
+
+class DFlashModel(Model):
+    config_class = DFlashConfig
+
+    # Encoder tensor keys; overridden by variants with a different namespace
+    key_fc = "fc"
+    key_fc_norm = "hidden_norm"
+
+    def __init__(
+        self,
+        config: DFlashConfig,
+        **kwargs
+    ):
+        super().__init__(config, **kwargs)
+
+        self.input_layer = DFlashInputLayer(
+            config = config,
+            key = self.key_fc,
+            key_norm = self.key_fc_norm,
+            hidden_size = config.hidden_size,
+            target_state_size = config.hidden_size * len(config.target_layer_ids),
+            mask_token_id = config.mask_token_id,
+            rms_norm_eps = config.rms_norm_eps,
+            native_draft_len = config.block_size,
+            qmap = "target_hidden",
+        )
+        self.modules += [self.input_layer]
+
+        self.first_block_idx = len(self.modules)
+        self.attn_modules = []
+
+        for idx in range(config.num_hidden_layers):
+            is_swa = config.layer_types[idx] == "sliding_attention"
+
+            attn = Attention(
+                config = config,
+                key = f"layers.{idx}.self_attn",
+                layer_idx = idx,
+                hidden_size = config.hidden_size,
+                head_dim = config.head_dim,
+                num_q_heads = config.num_q_heads,
+                num_kv_heads = config.num_kv_heads,
+                rope_settings = config.rope_settings,
+                key_q = "q_proj",
+                key_k = "k_proj",
+                key_v = "v_proj",
+                key_o = "o_proj",
+                qmap = "block.attn",
+                sliding_window = config.sliding_window if is_swa else -1,
+                q_norm = RMSNorm(
+                    config = config,
+                    key = f"layers.{idx}.self_attn.q_norm",
+                    rms_norm_eps = config.rms_norm_eps,
+                ),
+                k_norm = RMSNorm(
+                    config = config,
+                    key = f"layers.{idx}.self_attn.k_norm",
+                    rms_norm_eps = config.rms_norm_eps,
+                ),
+                out_dtype = torch.float,
+            )
+            self.attn_modules.append(attn)
+
+            self.modules += [
+                TransformerBlock(
+                    config = config,
+                    key = f"layers.{idx}",
+                    layer_idx = idx,
+                    attn_norm = RMSNorm(
+                        config = config,
+                        key = f"layers.{idx}.input_layernorm",
+                        rms_norm_eps = config.rms_norm_eps,
+                    ),
+                    attn = attn,
+                    mlp_norm = RMSNorm(
+                        config = config,
+                        key = f"layers.{idx}.post_attention_layernorm",
+                        rms_norm_eps = config.rms_norm_eps,
+                    ),
+                    mlp = GatedMLP(
+                        config = config,
+                        key = f"layers.{idx}.mlp",
+                        hidden_size = config.hidden_size,
+                        intermediate_size = config.intermediate_size,
+                        key_up = "up_proj",
+                        key_gate = "gate_proj",
+                        key_down = "down_proj",
+                        qmap = "block.mlp",
+                        interm_dtype = torch.half,
+                        out_dtype = torch.float,
+                    ),
+                )
+            ]
+
+        self.last_kv_module_idx = len(self.modules) - 1
+
+        self.modules += [
+            RMSNorm(
+                config = config,
+                key = f"norm",
+                rms_norm_eps = config.rms_norm_eps,
+                out_dtype = torch.half,
+            )
+        ]
+
+        self.logit_layer_idx = None
+        self.caps.update({
+            "uncalibrated_quantize": True,
+            "supports_tp": False,
+            "attach_target": True,
+            "dflash_draft": True,
+            "default_draft_size": config.block_size - 1,
+            "autosplit_load_fwd": False,
+        })
+
+        self.attached_model = None
+
+        self.draft_verifier_params.update({
+            "export_state_layers": set(config.target_layer_ids),
+        })
+
+
+    def attach_to(self, target):
+        self.attached_model = weakref.ref(target)
+        self.input_layer.attached_model = weakref.ref(target)
+
+
+    def update_kv_from_target(
+        self,
+        target_hidden: list,
+        cache: Cache,
+        params: dict,
+        lengths: list[int] = None,
+    ):
+        """
+        Update K/V cache with hidden states extracted from target model
+
+        params:
+            "block_table": torch.Tensor
+            "cache_seqlens": torch.Tensor
+        """
+
+        # May update a few redundant tokens when batching, but we'd never draft longer than the cache length
+        if lengths is not None:
+            max_length = max(lengths)
+            target_hidden = [t[:, :max_length] for t in target_hidden]
+
+        # Ensure all state snapshots are on the same device
+        device = self.input_layer.device
+        for i in range(len(target_hidden)):
+            if target_hidden[i].device != device:
+                if no_p2p_copy:
+                    target_hidden[i] = target_hidden[i].cpu().to(device)
+                else:
+                    target_hidden[i] = target_hidden[i].to(device)
+
+        # Projection concatenated states to hidden size, once
+        target_hidden = torch.cat(target_hidden, dim = -1)
+        target_hidden = self.input_layer.proj.forward(target_hidden, {}, out_dtype = torch.half)
+        target_hidden = self.input_layer.norm.forward(target_hidden, {}, out_dtype = torch.half)
+
+        bsz, target_seqlen, dim = target_hidden.shape
+        params["target_hidden_cc"] = target_hidden
+
+        # Update KV layers
+        for layer in self.attn_modules:
+            block_table = get_for_device(params, "block_table", layer.device)
+            cache_seqlens = get_for_device(params, "cache_seqlens", layer.device)
+            target_hidden = get_for_device(params, "target_hidden_cc", layer.device)
+
+            # k/v project
+            k = layer.k_proj.forward(target_hidden, params)
+            v = layer.v_proj.forward(target_hidden, params)
+            k = k.view(bsz, target_seqlen, layer.num_kv_heads, layer.head_dim)
+            v = v.view(bsz, target_seqlen, layer.num_kv_heads, layer.head_dim)
+
+            # Apply rope and norm to k
+            k, _ = layer.rope.apply(
+                k, None,
+                0,
+                cache_seqlens,
+                None,
+                True,
+                layer.k_norm_tensor,
+                None,
+                layer.norm_eps,
+                layer.norm_constant_bias,
+                None,
+                False,
+            )
+
+            # Write k, v rows to the paged cache; quantized caches quantize them in place rather
+            # than dequantizing/requantizing full layers
+            cache.update_layer_direct(layer.layer_idx, cache_seqlens, block_table, k, v, target_seqlen, 0)
+
+
+    def sample_from_state(
+        self,
+        state: torch.Tensor,
+        params: dict
+    ) -> torch.Tensor:
+        if not self.attached_model().loaded_tp:
+            ll = self.attached_model().logit_layer_idx
+            lm = self.attached_model().modules[ll]
+            logits = lm.prepare_for_device(state, params)
+            logits = lm.forward(logits, params)
+            logits = logits[..., :self.attached_model().config.vocab_size]
+            return torch.argmax(logits, dim = -1)
+        else:
+            state = self.attached_model().tp_producer.send(state)
+            argmax = self.attached_model().tp_dispatch_lm_head_argmax((state, {}))
+            return argmax
+
+
+    def default_load_shape_dtype(self, chunk_size):
+        return (1, 1), torch.long
+
+
+    def default_load_params(self, max_chunk_size):
+        return {}
+
+
+    @override
+    def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+        # The draft block attends to itself bidirectionally; causality on the sliding-window
+        # layers is expressed through their window (left sw, right 0) instead
+        params["causal"] = False
+        input_ids = prepare_for_attn(input_ids, params)
+        return input_ids
+
+
+    @override
+    def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
+        raise NotImplementedError()
+
+
+    @classmethod
+    @override
+    def get_additional_compiled_tensors(cls, config: DFlashConfig) -> dict:
+        # The fc norm is stored in DFlashInputLayer but doesn't match the fc module-key prefix
+        norm_weight = config.stc.list_tensors(prefix = cls.key_fc_norm)
+        return norm_weight

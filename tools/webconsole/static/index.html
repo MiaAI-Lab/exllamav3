@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EXL3 Console</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b8cff'/%3E%3Ctext x='16' y='22' font-family='sans-serif' font-size='14' font-weight='bold' text-anchor='middle' fill='%23071018'%3EE3%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+
+<aside id="sidebar">
+  <div class="brand">
+    <div class="logo">E3</div>
+    <div>
+      <div class="t">EXL3 Console</div>
+      <div class="s">DGX Spark workspace</div>
+    </div>
+  </div>
+  <nav id="nav">
+    <div class="grp">Overview</div>
+    <div class="nav-item" data-view="dashboard"><span class="ic">▦</span> Dashboard</div>
+    <div class="nav-item" data-view="jobs"><span class="ic">☰</span> Jobs <span class="badge" id="badge-jobs">0</span></div>
+    <div class="nav-item" data-view="system"><span class="ic">♥</span> System</div>
+    <div class="grp">Operations</div>
+    <div class="nav-item" data-view="quantize"><span class="ic">◧</span> Quantize</div>
+    <div class="nav-item" data-view="serve"><span class="ic">⇄</span> Serve <span class="badge" id="badge-serve">–</span></div>
+    <div class="nav-item" data-view="chat"><span class="ic">✦</span> Chat</div>
+    <div class="nav-item" data-view="evaluate"><span class="ic">∑</span> Evaluate</div>
+    <div class="nav-item" data-view="tools"><span class="ic">⚒</span> Tools</div>
+    <div class="grp">Library</div>
+    <div class="nav-item" data-view="models"><span class="ic">⬢</span> Models</div>
+  </nav>
+  <div class="foot">
+    <b>exllamav3</b> <span id="foot-version">…</span><br>
+    <span id="foot-host"></span>
+  </div>
+</aside>
+
+<main>
+  <header id="topbar">
+    <h1 id="tb-title">Dashboard</h1>
+    <span class="sub" id="tb-sub"></span>
+    <div class="spacer"></div>
+    <div class="chips">
+      <div class="chip"><span class="dot" id="chip-gpu-dot"></span>GPU <b id="chip-gpu">–</b></div>
+      <div class="chip">RAM <b id="chip-ram">–</b></div>
+      <div class="chip">jobs <b id="chip-jobs">–</b></div>
+    </div>
+  </header>
+
+  <div id="views">
+
+    <!-- ================= dashboard ================= -->
+    <section class="view" id="view-dashboard">
+      <div class="grid cols-3" id="dash-stats"></div>
+      <div class="section-head"><h2>Active jobs</h2>
+        <span class="desc">running under this console</span></div>
+      <div class="card"><div id="dash-jobs"></div></div>
+      <div class="section-head"><h2>Serving</h2></div>
+      <div class="card" id="dash-serve"></div>
+    </section>
+
+    <!-- ================= quantize ================= -->
+    <section class="view" id="view-quantize">
+      <div class="grid stat-2">
+        <div class="card pad-lg">
+          <h3>New conversion</h3>
+          <div class="desc" id="quant-desc"></div>
+          <div class="form-grid" id="quant-form"></div>
+          <div class="btn-row">
+            <button class="btn primary" id="quant-start">▶ Start conversion</button>
+            <button class="btn" id="quant-preflight">Preflight only</button>
+          </div>
+        </div>
+        <div>
+          <div class="card">
+            <h3>Resume interrupted job</h3>
+            <div class="form-grid" id="resume-form" style="grid-template-columns:1fr"></div>
+            <div class="btn-row"><button class="btn" id="resume-btn">⟳ Resume</button></div>
+          </div>
+          <div class="card" style="margin-top:14px">
+            <h3>Attach draft bundle</h3>
+            <div class="form-grid" id="attach-form" style="grid-template-columns:1fr"></div>
+            <div class="btn-row"><button class="btn" id="attach-btn">Attach draft</button></div>
+          </div>
+        </div>
+      </div>
+      <div class="section-head"><h2>Recent quantizations</h2>
+        <span class="desc">from jobs.jsonl + console registry</span></div>
+      <div class="card"><div id="quant-history"></div></div>
+    </section>
+
+    <!-- ================= serve ================= -->
+    <section class="view" id="view-serve">
+      <div class="grid stat-2">
+        <div class="card pad-lg">
+          <h3>Start OpenAI-compatible server</h3>
+          <div class="desc" id="serve-desc"></div>
+          <div class="form-grid" id="serve-form"></div>
+          <div class="btn-row">
+            <button class="btn primary" id="serve-start">▶ Start server</button>
+          </div>
+        </div>
+        <div class="card">
+          <h3>Health probe</h3>
+          <div class="desc">Checks /health on any running endpoint.</div>
+          <div class="field"><label>Endpoint URL</label>
+            <input type="text" id="health-url" value="http://127.0.0.1:8888"></div>
+          <div class="btn-row"><button class="btn" id="health-btn">Probe</button></div>
+          <div id="health-out" class="small" style="margin-top:10px"></div>
+        </div>
+      </div>
+      <div class="section-head"><h2>Running servers</h2></div>
+      <div class="card"><div id="serve-list"></div></div>
+    </section>
+
+    <!-- ================= chat ================= -->
+    <section class="view" id="view-chat">
+      <div class="card pad-lg">
+        <h3>Chat playground <span class="rt" id="chat-target"></span></h3>
+        <div class="desc">Talks to a running serve_openai endpoint through the console
+          (streaming, reasoning, tool calls). Pick the endpoint:</div>
+        <div class="form-grid" style="margin-bottom:12px">
+          <div class="field"><label>Server base URL</label>
+            <input type="text" id="chat-base" value="http://127.0.0.1:8888"></div>
+          <div class="field"><label>System prompt (optional)</label>
+            <input type="text" id="chat-system" placeholder="You are a helpful assistant."></div>
+        </div>
+        <div class="form-grid" style="margin-bottom:14px">
+          <div class="field"><label>Temperature</label><input type="number" id="chat-temp" value="0.6" step="0.1"></div>
+          <div class="field"><label>Top-p</label><input type="number" id="chat-topp" value="0.95" step="0.01"></div>
+          <div class="field"><label>Top-k</label><input type="number" id="chat-topk" value="20" step="1"></div>
+          <div class="field"><label>Max tokens</label><input type="number" id="chat-maxtok" value="1024" step="128"></div>
+        </div>
+        <div id="chat-log"><div class="empty">No messages yet — say hi to the model.</div></div>
+        <div class="chat-input">
+          <textarea id="chat-input" placeholder="Message the model… (Enter to send, Shift+Enter for newline)"></textarea>
+          <button class="btn primary" id="chat-send">Send</button>
+          <button class="btn danger" id="chat-stop" disabled>Stop</button>
+          <button class="btn ghost" id="chat-clear">Clear</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= evaluate ================= -->
+    <section class="view" id="view-evaluate">
+      <div class="card pad-lg">
+        <h3>Run evaluation</h3>
+        <div class="desc">Every eval script from <span class="mono">eval/</span>, with its full CLI options.
+          Runs as a tracked job — watch the log below.</div>
+        <div class="field" style="max-width:460px;margin-bottom:14px">
+          <label>Evaluation</label>
+          <select id="eval-select"></select>
+        </div>
+        <div class="desc" id="eval-desc"></div>
+        <div class="form-grid" id="eval-form"></div>
+        <div class="btn-row"><button class="btn primary" id="eval-run">▶ Run evaluation</button></div>
+      </div>
+      <div class="section-head"><h2>Recent evaluation jobs</h2></div>
+      <div class="card"><div id="eval-history"></div></div>
+    </section>
+
+    <!-- ================= tools ================= -->
+    <section class="view" id="view-tools">
+      <div class="card pad-lg">
+        <h3>Run tool</h3>
+        <div class="desc">Standalone utilities from <span class="mono">tools/</span> — dequantizers,
+          benches, probes. Runs as a tracked job.</div>
+        <div class="field" style="max-width:460px;margin-bottom:14px">
+          <label>Tool</label>
+          <select id="tool-select"></select>
+        </div>
+        <div class="desc" id="tool-desc"></div>
+        <div class="form-grid" id="tool-form"></div>
+        <div class="btn-row"><button class="btn primary" id="tool-run">▶ Run tool</button></div>
+      </div>
+      <div class="section-head"><h2>Recent tool jobs</h2></div>
+      <div class="card"><div id="tool-history"></div></div>
+    </section>
+
+    <!-- ================= models ================= -->
+    <section class="view" id="view-models">
+      <div class="card">
+        <h3>Model library <span class="rt"><button class="btn sm" id="models-refresh">↻ Refresh</button></span></h3>
+        <div class="desc">Contents of <span class="mono">test_models/</span> and
+          <span class="mono">test_models/sources/</span>. Size = top-level files (shards dominate).</div>
+        <div id="models-table"></div>
+      </div>
+    </section>
+
+    <!-- ================= jobs ================= -->
+    <section class="view" id="view-jobs">
+      <div class="card">
+        <h3>All jobs <span class="rt">
+          <select id="jobs-filter" style="width:auto;padding:4px 26px 4px 10px;font-size: 14px">
+            <option value="all">all kinds</option>
+            <option value="quant">quant</option>
+            <option value="eval">eval</option>
+            <option value="tool">tool</option>
+            <option value="serve">serve</option>
+            <option value="preflight">preflight</option>
+          </select>
+          <button class="btn sm" id="jobs-refresh">↻ Refresh</button></span></h3>
+        <div class="desc">Console jobs live in <span class="mono">runs/webui/jobs.jsonl</span>;
+          legacy quantization records from <span class="mono">jobs.jsonl</span> are shown below them.
+          Detached jobs survive a console restart.</div>
+        <div id="jobs-table"></div>
+      </div>
+    </section>
+
+    <!-- ================= system ================= -->
+    <section class="view" id="view-system">
+      <div class="grid cols-2" id="sys-cards"></div>
+    </section>
+
+  </div>
+</main>
+
+<!-- ================= job log drawer ================= -->
+<div id="overlay">
+  <div id="drawer">
+    <h2 id="drawer-title"></h2>
+    <div class="meta" id="drawer-meta"></div>
+    <div class="log-head">
+      <span id="drawer-status"></span>
+      <span class="spacer"></span>
+      <label class="small"><input type="checkbox" id="drawer-autoscroll" checked> autoscroll</label>
+      <button class="btn sm" id="drawer-refresh">↻</button>
+      <button class="btn sm danger" id="drawer-kill">Kill</button>
+      <button class="btn sm ghost" id="drawer-close">✕ close</button>
+    </div>
+    <div class="logbox tall" id="drawer-log"></div>
+    <div class="small muted mono" id="drawer-path"></div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+<script src="/app.js"></script>
+</body>
+</html>

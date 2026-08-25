@@ -1,0 +1,138 @@
+from setuptools import setup
+import importlib.util
+import os
+
+if torch := importlib.util.find_spec("torch") is not None:
+    from torch.utils import cpp_extension
+    from torch import version as torch_version
+
+extension_name = "exllamav3_ext"
+precompile = "EXLLAMA_NOCOMPILE" not in os.environ
+verbose = "EXLLAMA_VERBOSE" in os.environ
+ext_debug = "EXLLAMA_EXT_DEBUG" in os.environ
+
+if precompile and not torch:
+    print("Cannot precompile unless torch is installed.")
+    print("To explicitly JIT install run EXLLAMA_NOCOMPILE= pip install <xyz>")
+
+windows = os.name == "nt"
+
+extra_cflags = []
+extra_cuda_cflags = [
+    "-lineinfo", "-O3", "--use_fast_math",
+    "-Xcudafe", "--diag_suppress=177",
+    "-Xcudafe", "--diag_suppress=20012",
+]
+
+if windows:
+    # NOMINMAX: windows.h otherwise defines min/max function-like macros that break every
+    # std::min/std::max call site parsed after it (WIN32_LEAN_AND_MEAN does not suppress them).
+    # Defined globally so it holds regardless of include order in any TU.
+    # No -std flags here: torch's cpp_extension appends its own (unconditionally on the Windows
+    # nvcc path), and a second -std argument is a fatal nvcc error, not an override.
+    extra_cflags += ["/Ox", "/Zc:preprocessor", "/DWIN32_LEAN_AND_MEAN", "/DNOMINMAX"]
+    extra_cuda_cflags += ["-DWIN32_LEAN_AND_MEAN", "-DNOMINMAX", "-Xcompiler=/Zc:preprocessor"]
+    if ext_debug:
+        extra_cflags += ["/Zi"]
+        extra_cuda_cflags += []
+else:
+    extra_cflags += ["-Ofast"]
+    extra_cuda_cflags += []
+    if ext_debug:
+        extra_cflags += ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
+        extra_cuda_cflags += []
+
+if cuda_host_cxx := os.environ.get("CUDAHOSTCXX"):
+    extra_cuda_cflags += ["-ccbin", cuda_host_cxx]
+
+if torch and torch_version.hip:
+    extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
+
+extra_compile_args = {
+    "cxx": extra_cflags,
+    "nvcc": extra_cuda_cflags,
+}
+
+library_dir = "exllamav3"
+sources_dir = os.path.join(library_dir, extension_name)
+sources = [
+    os.path.relpath(os.path.join(root, file), start=os.path.dirname(__file__))
+    for root, _, files in os.walk(sources_dir)
+    for file in files
+    if file.endswith(('.c', '.cpp', '.cu'))
+]
+
+print (sources)
+
+setup_kwargs = (
+    {
+        "ext_modules": [
+            cpp_extension.CUDAExtension(
+                extension_name,
+                sources,
+                extra_compile_args=extra_compile_args,
+                libraries=["cublas"] if windows else [],
+            )
+        ],
+        "cmdclass": {"build_ext": cpp_extension.BuildExtension},
+    }
+    if precompile and torch
+    else {}
+)
+
+version_py = {}
+with open("exllamav3/version.py", encoding="utf8") as fp:
+    exec(fp.read(), version_py)
+version = version_py["__version__"]
+print("Version:", version)
+
+setup(
+    name="exllamav3",
+    version=version,
+    packages=[
+        "exllamav3",
+        "exllamav3.generator",
+        "exllamav3.generator.sampler",
+        "exllamav3.generator.filter",
+        "exllamav3.conversion",
+        "exllamav3.conversion.standard_cal_data",
+        "exllamav3.integration",
+        "exllamav3.architecture",
+        "exllamav3.architecture.mm_processing",
+        "exllamav3.model",
+        "exllamav3.modules",
+        "exllamav3.modules.attention_fn",
+        "exllamav3.modules.arch_specific",
+        "exllamav3.modules.gated_delta_net_fn",
+        "exllamav3.modules.quant",
+        "exllamav3.modules.quant.exl3_lib",
+        "exllamav3.tokenizer",
+        "exllamav3.cache",
+        "exllamav3.loader",
+        "exllamav3.util",
+    ],
+    url="https://github.com/turboderp-org/exllamav3",
+    license="MIT",
+    author="turboderp",
+    install_requires=[
+        "torch>=2.6.0",
+        "tokenizers>=0.21.1",
+        "numpy>=2.1.0",
+        "rich",
+        "typing_extensions",
+        "safetensors>=0.3.2",
+        "ninja",
+        "pillow",
+        "pyyaml",
+        "marisa_trie",
+        "pydantic",
+        "llguidance>=1.7.0",
+        "flash-linear-attention>=0.5.0",
+    ],
+    include_package_data=True,
+    package_data = {
+        "": ["py.typed"],
+    },
+    verbose=verbose,
+    **setup_kwargs,
+)

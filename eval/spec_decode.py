@@ -1,0 +1,326 @@
+import sys, os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from exllamav3 import Generator, Job, model_init, GreedySampler, TopPSampler
+import argparse
+import torch
+import json
+from tabulate import tabulate
+
+# ANSI codes
+col_default = "\u001b[0m"
+col_yellow = "\u001b[33;1m"
+col_blue = "\u001b[34;1m"
+col_magenta = "\u001b[35;1m"
+col_red = "\u001b[31;1m"
+col_green = "\u001b[32;1m"  # Green
+
+prompt_files = [
+    ("Trivial repetition", "trivial.json", False),
+    ("Agentic, code", "agentic_code_01.json", True),
+    ("Agentic, code", "agentic_code_05.json", True),
+    ("Agentic, code", "agentic_code_10.json", True),
+    ("Agentic, code", "agentic_code_20.json", True),
+    ("Agentic, code", "agentic_code_29.json", True),
+    ("Agentic, curl", "agentic_curl_05.json", True),
+    ("Agentic, curl", "agentic_curl_10.json", True),
+    ("Agentic, curl", "agentic_curl_15.json", True),
+    ("Agentic, curl", "agentic_curl_16.json", True),
+    ("Creative", "creative_01.json", False),
+    ("Creative", "creative_02.json", False),
+    ("Creative (reasoning)", "creative_01.json", True),
+    ("Creative (reasoning)", "creative_02.json", True),
+    ("Creative (reasoning)", "creative_03.json", True),
+    ("Translation", "translate_01.json", False),
+    ("Translation", "translate_02.json", False),
+    ("Translation (reasoning)", "translate_01.json", True),
+    ("Translation (reasoning)", "translate_02.json", True),
+    ("Coding", "coding_01.json", False),
+    ("Coding", "coding_02.json", False),
+    ("Coding", "coding_03.json", False),
+]
+
+
+def measure(generator, tokenizer, sampler, max_new_tokens, stats_sink = None):
+    path = os.path.dirname(os.path.abspath(__file__))
+    all_results = {}
+
+    for category, filename, think in prompt_files:
+        with open(os.path.join(path, "prompts", filename), "r") as f:
+            data = json.load(f)
+
+        for msg in data["messages"]:
+            if msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    func = tc.get("function", {})
+                    args = func.get("arguments")
+                    if isinstance(args, str):
+                        func["arguments"] = json.loads(args)
+
+        prompt_ids = tokenizer.hf_chat_template(
+            messages = data["messages"],
+            add_generation_prompt = True,
+            functions = data.get("functions"),
+            tools = data.get("tools"),
+            enable_thinking = think
+        )
+
+        job = Job(
+            input_ids = prompt_ids,
+            max_new_tokens = max_new_tokens,
+            stop_conditions = generator.model.config.eos_token_id_list,
+            sampler = sampler,
+        )
+        generator.enqueue(job)
+
+        while generator.num_remaining_jobs():
+            results = generator.iterate()
+            for result in results:
+                if result["stage"] == "prefill":
+                    curr_progress = result["curr_progress"]
+                    max_progress = result["max_progress"]
+                    print(f"Prefill: {curr_progress:,} / {max_progress:,}...")
+                text = result.get("text", "")
+                print(text, end = "", flush = True)
+                if result.get("eos"):
+                    print("\n--------")
+                    break
+
+        new_tokens = result["new_tokens"]
+        gen_tps = new_tokens / result["time_generate"]
+        if "accepted_draft_tokens" in result:
+            dacc = result["accepted_draft_tokens"]
+            drej = result["rejected_draft_tokens"]
+            dtot = dacc + drej
+            acc_rate = dacc / dtot if dtot else 0
+        else:
+            acc_rate = None
+
+        if category not in all_results:
+            all_results[category] = []
+        all_results[category].append({
+            "new_tokens": new_tokens,
+            "gen_tps": gen_tps,
+            "acc_rate": acc_rate,
+        })
+
+        if stats_sink is not None and job.draft_stats:
+            stats_sink.append({
+                "category": category,
+                "file": filename,
+                "stats": job.draft_stats,  # (position, window, accepted, ema) per verification round
+            })
+
+    aggregated = {
+        category: (
+            sum(m["gen_tps"] * m["new_tokens"] for m in cat_results) /
+            sum(m["new_tokens"] for m in cat_results)
+        )
+        for category, cat_results in all_results.items()
+    }
+    return aggregated
+
+
+def plot_stats(stats_sink):
+    """
+    Show accepted draft tokens per verification round vs generation position, with the EMA and chosen window
+    overlaid, one panel per trace.
+    """
+    import matplotlib.pyplot as plt
+
+    n = len(stats_sink)
+    fig, axes = plt.subplots(n, 1, figsize = (14, min(3.2 * n, 18)), squeeze = False)
+    axes = axes[:, 0]
+
+    for ax, trace in zip(axes, stats_sink):
+        stats = trace["stats"]
+        pos      = [s[0] for s in stats]
+        window   = [s[1] for s in stats]
+        accepted = [s[2] for s in stats]
+        ema      = [s[3] for s in stats]
+
+        ax.scatter(pos, accepted, s = 6, color = "tab:blue", alpha = 0.45, label = "accepted / window", zorder = 3)
+        ax.step(pos, window, where = "post", color = "tab:red", lw = 1.0, alpha = 0.8, label = "window (chosen)")
+        if any(e is not None for e in ema):
+            ax.plot(pos, ema, color = "tab:green", lw = 1.4, label = "EMA")
+        ax.set_title(f"{trace['category']} - {trace['file']}", fontsize = 10)
+        ax.set_ylabel("draft tokens")
+        ax.set_ylim(-0.4, max(window) + 1.4)
+        ax.grid(alpha = 0.25)
+        ax.legend(loc = "upper right", fontsize = 8)
+
+    axes[-1].set_xlabel("generation position (tokens)")
+    fig.tight_layout()
+    plt.show()
+
+
+def print_stats(stats_sink):
+    headers = [
+        f"{col_yellow}from_pos{col_default}",
+        f"{col_yellow}window{col_default}",
+        f"{col_yellow}accepted{col_default}",
+        f"{col_yellow}ema{col_default}",
+    ]
+    for trace in stats_sink:
+        print(f"\n{trace['category']} - {trace['file']}\n")
+        rows = [[r[0] - r[2], r[1], r[2], r[3]] for r in trace["stats"]]
+        if all(r[3] is None for r in rows):
+            h = headers[:3]
+            rows = [r[:3] for r in rows]
+        else:
+            h = headers
+        print(tabulate(rows, headers = h, tablefmt = "pipe", colalign = ("right",) * len(h)))
+
+
+@torch.inference_mode()
+def main(args):
+    model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(
+        args,
+        min_draft_len = args.s_ngram_draft_length
+    )
+
+    # Optionlly limit scope
+    if sw := args.single_workload:
+        global prompt_files
+        if sw.endswith("*"):
+            sw = sw[:-1]
+            prompt_files = [p for p in prompt_files if p[0].lower().startswith(sw.lower())]
+        else:
+            prompt_files = [p for p in prompt_files if p[0].lower() == sw.lower()]
+
+    stats_sink = [] if (args.draft_stats or args.plot_stats or args.print_stats) else None
+
+    # Baseline
+    result_baseline = None
+    if not args.no_baseline:
+        generator = Generator(
+            model = model,
+            cache = cache,
+            tokenizer = tokenizer,
+            max_chunk_size = 4096,
+        )
+        result_baseline = measure(generator, tokenizer, GreedySampler(), args.max_new_tokens)
+
+    # N-gram draft
+    result_ngram = None
+    result_ngram_temp = None
+    if args.s_ngram_match_min:
+        generator = Generator(
+            model = model,
+            cache = cache,
+            tokenizer = tokenizer,
+            ngram_match_min = args.s_ngram_match_min,
+            num_draft_tokens = args.s_ngram_draft_length,
+            dynamic_draft_tokens = args.dynamic_draft,
+            dynamic_draft_skip_ema = args.draft_skip_ema,
+            record_draft_stats = stats_sink is not None,
+            max_chunk_size = 4096,
+        )
+        result_ngram = measure(generator, tokenizer, GreedySampler(), args.max_new_tokens, stats_sink)
+        if args.temperature:
+            result_ngram_temp = measure(generator, tokenizer, TopPSampler(0.9, 1), args.max_new_tokens)
+
+    # SD with draft model
+    result_draft = None
+    result_draft_temp = None
+    if args.draft_model_dir:
+        generator = Generator(
+            model = model,
+            cache = cache,
+            draft_model = draft_model,
+            draft_cache = draft_cache,
+            tokenizer = tokenizer,
+            num_draft_tokens = args.num_draft_tokens,
+            dynamic_draft_tokens = args.dynamic_draft,
+            dynamic_draft_skip_ema = args.draft_skip_ema,
+            record_draft_stats = stats_sink is not None,
+            max_chunk_size = 4096,
+        )
+        result_draft = measure(generator, tokenizer, GreedySampler(), args.max_new_tokens, stats_sink)
+        if args.temperature:
+            result_draft_temp = measure(generator, tokenizer, TopPSampler(0.9, 1), args.max_new_tokens)
+
+    # Print results
+    draft_mode = "Draft model"
+    if args.draft_model_dir and draft_model.caps.get("dflash_draft"):
+        draft_mode = "DFlash"
+    if args.draft_model_dir and draft_model.caps.get("mtp_draft"):
+        draft_mode = "MTP"
+    r = {
+        "Baseline": result_baseline,
+        "N-gram (greedy)": result_ngram,
+        "N-gram (temp 1)": result_ngram_temp,
+        f"{draft_mode} (greedy)": result_draft,
+        f"{draft_mode} (temp 1)": result_draft_temp,
+    }
+    r = {k: v for k, v in r.items() if v is not None}
+    if not r:
+        print("No results to display")
+        return
+
+    categories = sorted({ category for result in r.values() for category in result.keys() })
+    headers = [
+        f"{col_yellow}Category{col_default}",
+        *[f"{col_yellow}{name}{col_default}" for name in r.keys()],
+    ]
+    rows = []
+    for category in categories:
+        row = [f"{category}"]
+        baseline = None
+        for name, result in r.items():
+            res_cat = result.get(category)
+            if res_cat is not None:
+                speedup = None
+                if name == "Baseline":
+                    baseline = res_cat
+                elif baseline is not None:
+                    speedup = res_cat / baseline
+                s = f"{col_magenta}{res_cat:.2f}{col_default} t/s"
+                if speedup is not None:
+                    s += f", {col_green}{speedup:.2f}{col_default}x"
+            else:
+                s = "-"
+            row.append(s)
+        rows.append(row)
+
+    print()
+    print(tabulate(rows, headers = headers, tablefmt = "pipe", colalign=("left", *["right"] * (len(headers) - 1)),))
+    print()
+
+    if args.draft_stats and stats_sink:
+        with open(args.draft_stats, "w") as f:
+            json.dump(stats_sink, f)
+        print(f"Draft stats written to {args.draft_stats}")
+
+    if args.plot_stats:
+        if not stats_sink:
+            print("No draft stats recorded, nothing to plot")
+        else:
+            plot_stats(stats_sink)
+
+    if args.print_stats:
+        if not stats_sink:
+            print("No draft stats recorded, nothing to plot")
+        else:
+            print_stats(stats_sink)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(allow_abbrev = False)
+    model_init.add_args(
+        parser,
+        default_cache_size = 49152,
+        cache = True,
+        add_draft_model_args = True,
+        default_autosplit_max_batch_size = 1,
+    )
+    parser.add_argument("-nbl", "--no_baseline", action = "store_true", help = "Skip baseline measurement")
+    parser.add_argument("-ngram_min", "--s_ngram_match_min", type = int, help = "N-gram minimum match length, default = 0 (disabled)", default = 0)
+    parser.add_argument("-ngram_len", "--s_ngram_draft_length", type = int, help = "N-gram draft length, default = 4", default = 4)
+    parser.add_argument("-tokens", "--max_new_tokens", type = int, help = "Max sampled tokens per round", default = 1024)
+    parser.add_argument("-temp", "--temperature", action = "store_true", help = "Also sample with temperature")
+    parser.add_argument("-single", "--single_workload", type = str, help = "Limit to single workload", default = None)
+    parser.add_argument("-dstats", "--draft_stats", type = str, help = "Write per-round (position, window, accepted, ema) records to JSON file", default = None)
+    parser.add_argument("-plot", "--plot_stats", action = "store_true", help = "Plot per-round draft stats in a matplotlib window after the run")
+    parser.add_argument("-print", "--print_stats", action = "store_true", help = "Print per-round draft stats to the console after the run")
+    _args = parser.parse_args()
+    main(_args)
