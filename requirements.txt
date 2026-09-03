@@ -13,3 +13,4 @@ llguidance>=1.7.0
 flash-linear-attention>=0.5.0
 aiohttp
 huggingface_hub
+transformers

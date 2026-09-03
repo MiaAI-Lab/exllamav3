@@ -127,6 +127,7 @@ setup(
         "marisa_trie",
         "pydantic",
         "llguidance>=1.7.0",
+        "transformers",
         "flash-linear-attention>=0.5.0",
     ],
     include_package_data=True,
