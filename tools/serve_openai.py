@@ -475,7 +475,7 @@ async def chat_completions(request):
                     req["seed"], req["tools"], req["tool_choice"], req["stop"],
                     on_text = None if forced_choice else on_text)
                 loop.call_soon_threadsafe(queue.put_nowait,
-                                          ("done", (calls, finish, reasoning, content)))
+                                          ("done", (calls, finish, reasoning, content, ptoks, otoks)))
             except Exception as e:
                 loop.call_soon_threadsafe(queue.put_nowait, ("error", str(e)))
         loop.run_in_executor(None, worker)
@@ -553,7 +553,7 @@ async def chat_completions(request):
                 pending += payload
                 await flush_pending()
             elif kind == "done":
-                calls, finish, reasoning, content = payload
+                calls, finish, reasoning, content, ptoks, otoks = payload
                 await flush_pending(final = True)
                 if forced_choice:
                     # Buffered path (no deltas were streamed): emit the
@@ -566,6 +566,8 @@ async def chat_completions(request):
                     for c in calls:
                         await send_call(c)
                 await send({}, finish = finish)
+                await resp.write(
+                    f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [], "usage": {"prompt_tokens": ptoks, "completion_tokens": otoks, "total_tokens": ptoks + otoks}})}\n\n'.encode())
                 await resp.write(b"data: [DONE]\n\n")
                 break
         await resp.write_eof()
