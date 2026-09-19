@@ -27,6 +27,8 @@ source .env
 # .env is sourced as shell vars; the model-download subprocess needs the HF
 # token in its environment, so export it if set.
 if [ -n "${HF_TOKEN:-}" ]; then export HF_TOKEN; fi
+# serve_openai.py reads the per-reply default cap from its environment.
+if [ -n "${DEFAULT_MAX_TOKENS:-}" ]; then export DEFAULT_MAX_TOKENS; fi
 
 # --- bootstrap: build the venv + install the engine on first run ----------
 # Re-enters if the venv is missing OR the install is incomplete (e.g. a

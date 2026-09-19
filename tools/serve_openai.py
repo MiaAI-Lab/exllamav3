@@ -630,6 +630,11 @@ def tool_choice_directive(tool_choice, tools):
     return tools, None
 
 
+# Per-reply ceiling when the client sends no max_tokens. Covers long thinking;
+# only a stuck, looping reply gets near it. Override with env DEFAULT_MAX_TOKENS.
+DEFAULT_MAX_TOKENS = int(os.environ.get("DEFAULT_MAX_TOKENS", "32768"))
+
+
 def generate_full(generator, tokenizer, messages, max_tokens, temperature,
                   top_p, top_k, seed, tools, tool_choice = None, stop = None,
                   on_text = None, images = None):
@@ -697,6 +702,11 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
             embeddings = embed_images(tokenizer, images)
         input_ids = build_prompt_ids(tokenizer, messages, tools, embeddings)
         prompt_toks = int(input_ids.shape[-1])
+        # Default (None) = room left in the context, capped at DEFAULT_MAX_TOKENS
+        # so a looping reply can't hold the single slot until the cache fills.
+        # Explicit limits are honoured up to the room left.
+        room = max(1, int(stats.get("context_length") or 0) - prompt_toks)
+        max_tokens = min(room, DEFAULT_MAX_TOKENS) if not max_tokens else min(int(max_tokens), room)
         job = run_once()
         # Forced tool_choice is a prompt nudge; at temperature > 0 the model can
         # occasionally skip the call. One greedy retry makes it deterministic.
@@ -743,8 +753,10 @@ def parse_request(body):
     messages = body.get("messages")
     if not messages or not isinstance(messages, list):
         return None, "`messages` (list) is required"
-    max_tokens = int(body.get("max_tokens") or
-                     body.get("max_completion_tokens") or 1024)
+    # No limit sent (many agent clients never send one) = use the remaining
+    # context, like llama.cpp. A fixed 1024 default cut thinking-mode replies off mid-reasoning.
+    _mt = body.get("max_tokens") or body.get("max_completion_tokens")
+    max_tokens = int(_mt) if _mt else None
     temperature = float(body.get("temperature", 0.6))
     top_p = float(body.get("top_p", 0.95))
     top_k = int(body.get("top_k", 20))
