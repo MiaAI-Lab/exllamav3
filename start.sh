@@ -153,6 +153,10 @@ else
 fi
 CACHE_QUANT="${CACHE_QUANT:-none}"
 CPU_CACHE_GB="${CPU_CACHE_GB:-0}"
+# TENSOR_PARALLEL=1 splits the target across every GPU listed in GPU_MEM_GB
+# (comma list, one budget per GPU, e.g. 22,22). TP_BACKEND = native | nccl
+# (nccl measured ~20-30% faster prefill on 2x RTX 3090 over PCIe).
+TENSOR_PARALLEL="${TENSOR_PARALLEL:-0}"
 
 # --- speculative decoding method ---------------------------------------------
 # DRAFT = mtp | dflash2 | none (see .env.example for the trade-offs).
@@ -233,6 +237,12 @@ case "$DRAFT" in
 esac
 if [ "$CPU_CACHE_GB" != "0" ]; then
     cmd+=(--cpu_cache_size "$CPU_CACHE_GB")
+fi
+if [ -n "${RECURRENT_CACHE_GB:-}" ]; then
+    cmd+=(--recurrent_cache_size "$RECURRENT_CACHE_GB")
+fi
+if [ "$TENSOR_PARALLEL" = "1" ]; then
+    cmd+=(--tensor_parallel --tp_backend "${TP_BACKEND:-native}")
 fi
 
 echo "Starting: ${cmd[*]}"
