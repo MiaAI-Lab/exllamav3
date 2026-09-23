@@ -258,3 +258,148 @@ class CPUPageCache:
             t[page_index].copy_(v, non_blocking = True)
         self.metrics["restores"] += 1
         return e
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Tensor-parallel support (local patch 0003)
+#
+# Under TP the target cache tensors live in the TP workers (one shard per device; the output device's shard lives
+# in this process behind a pseudo-worker), so they can't be copied from here. TPCPUPageCache keeps the whole
+# index (hashes, recency, eviction) in the master exactly as CPUPageCache does, but each worker holds the pinned
+# host slabs for its own shard, keyed by the master's slot number. Stores and fetches are dispatched to every
+# worker through the same queue as forward passes, so they stay ordered with respect to the kernels that
+# overwrite or read the page. Non-TP caches (e.g. a DFlash2 draft cache) are handled locally by the base class.
+
+def mp_cpu_tier_page_bytes(local_context: dict, cache_id: int):
+    total = 0
+    for module in local_context["kv_modules"]:
+        layer = module.tp_cache_lookup.get(cache_id)
+        if layer is None:
+            continue
+        for t in layer.get_tensors():
+            if t is not None:
+                total += _align(t[0].numel() * t.element_size(), 256)
+    return total
+
+
+def _mp_cpu_tier_tensors(local_context: dict, cache_id: int):
+    key = ("cpu_tier_tensors", cache_id)
+    ts = local_context.get(key)
+    if ts is None:
+        ts = []
+        for module in local_context["kv_modules"]:
+            layer = module.tp_cache_lookup.get(cache_id)
+            if layer is None:
+                continue
+            ts += [t for t in layer.get_tensors() if t is not None]
+        local_context[key] = ts
+    return ts
+
+
+def _mp_cpu_tier_views(local_context: dict, cache_id: int, slot: int):
+    slabs = local_context.setdefault(("cpu_tier_slabs", cache_id), {})
+    views = slabs.get(slot)
+    if views is None:
+        ts = _mp_cpu_tier_tensors(local_context, cache_id)
+        sizes = [_align(t[0].numel() * t.element_size(), 256) for t in ts]
+        slab = torch.empty((max(sum(sizes), 1),), dtype = torch.uint8, pin_memory = True)
+        views, offset = [], 0
+        for t, n in zip(ts, sizes):
+            nb = t[0].numel() * t.element_size()
+            views.append(slab[offset : offset + nb].view(t.dtype).view(tuple(t.shape[1:])))
+            offset += n
+        slabs[slot] = views
+    return views
+
+
+def mp_cpu_tier_store(local_context: dict, cache_id: int, slot: int, page_index: int):
+    ts = _mp_cpu_tier_tensors(local_context, cache_id)
+    for v, t in zip(_mp_cpu_tier_views(local_context, cache_id, slot), ts):
+        v.copy_(t[page_index], non_blocking = True)
+
+
+def mp_cpu_tier_fetch(local_context: dict, cache_id: int, slot: int, page_index: int):
+    ts = _mp_cpu_tier_tensors(local_context, cache_id)
+    for v, t in zip(_mp_cpu_tier_views(local_context, cache_id, slot), ts):
+        t[page_index].copy_(v, non_blocking = True)
+
+
+class TPCPUPageCache(CPUPageCache):
+
+    def __init__(self, caches: list, max_size: int):
+        tp_caches = [c for c in caches if c.model.loaded_tp]
+        local_caches = [c for c in caches if not c.model.loaded_tp]
+        assert len(tp_caches) == 1, "TPCPUPageCache expects exactly one tensor-parallel cache"
+        self.tp_cache = tp_caches[0]
+        self.tp_model = self.tp_cache.model
+        self.tp_cache_id = id(self.tp_cache)
+
+        # Bytes per page held by the workers (sum over TP shards)
+        m = self.tp_model
+        for device in m.active_devices:
+            m.tp_worker_dispatch(device, mp_cpu_tier_page_bytes, (self.tp_cache_id,))
+        self.tp_page_bytes = sum(m.tp_worker_result(device) for device in m.active_devices)
+        assert self.tp_page_bytes > 0, "No TP cache tensors found for CPU page cache tier"
+
+        # Local (non-TP) part: base-class slabs, possibly empty
+        self.segments = []
+        offset = 0
+        for cache in local_caches:
+            for layer in cache.layers.values():
+                for t in layer.get_tensors():
+                    if t is None:
+                        continue
+                    self.segments.append((t, offset, tuple(t.shape[1:]), t.dtype))
+                    offset = _align(offset + t[0].numel() * t.element_size(), 256)
+        self.slot_size = _align(max(offset, 1), 4096)
+        self.max_slots = int(max_size) // (self.slot_size + self.tp_page_bytes)
+        assert self.max_slots >= 2, "CPU page cache too small for two pages"
+
+        self.pagetable = None
+        self.entries = {}
+        self.slot_slabs = []
+        self.slot_views = []
+        self.free_slots = deque()
+        self._order = deque()
+        self._order_pops = 0
+        self._order_rebuild = max(64, self.max_slots // 8)
+        self.metrics = {"pushes": 0, "dedup_hits": 0, "restores": 0, "evictions": 0, "cold_allocs": 0}
+        # Worker slabs are pinned lazily on first use of a slot; the local part keeps the background pinner
+        self._spare = deque()
+        self._spare_cond = threading.Condition()
+        self._alloc_thread = threading.Thread(target = self._alloc_worker, daemon = True)
+        self._alloc_thread.start()
+
+    def _dispatch(self, fn, slot: int, page_index: int):
+        m = self.tp_model
+        for device in m.active_devices:
+            m.tp_worker_dispatch(device, fn, (self.tp_cache_id, slot, page_index))
+        for device in m.active_devices:
+            m.tp_worker_result(device)
+
+    def store(self, page, serial: int, protect: set | None = None):
+        e = self.entries.get(page.phash)
+        if e is not None:
+            e["access_serial"] = serial
+            self.metrics["dedup_hits"] += 1
+            return
+        slot = self._new_slot(protect)
+        for v, (t, _, _, _) in zip(self.slot_views[slot], self.segments):
+            v.copy_(t[page.page_index], non_blocking = True)
+        self._dispatch(mp_cpu_tier_store, slot, page.page_index)
+        self.entries[page.phash] = {
+            "slot": slot,
+            "prev_hash": page.prev_hash,
+            "access_serial": serial,
+            "tokens": page.sequence.clone(),
+        }
+        self.metrics["pushes"] += 1
+
+    def fetch(self, phash: bytes, page_index: int, serial: int) -> dict:
+        e = self.entries[phash]
+        e["access_serial"] = serial
+        for v, (t, _, _, _) in zip(self.slot_views[e["slot"]], self.segments):
+            t[page_index].copy_(v, non_blocking = True)
+        self._dispatch(mp_cpu_tier_fetch, e["slot"], page_index)
+        self.metrics["restores"] += 1
+        return e
