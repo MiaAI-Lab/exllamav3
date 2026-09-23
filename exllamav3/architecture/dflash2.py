@@ -160,11 +160,13 @@ class DFlash2Model(DFlashModel):
         anchor. Greedy walk at every temperature (lossless: verification is
         accept-while-match against target samples)."""
         if self.attached_model().loaded_tp:
-            raise NotImplementedError(
-                "DFlash2Model does not yet support tensor-parallel targets"
-            )
-        ll = self.attached_model().logit_layer_idx
-        lm = self.attached_model().modules[ll]
+            # TP target: its lm_head is sharded across worker processes, but the
+            # selector needs real logits (top-k per row), so use a private,
+            # unsharded copy of the target's lm_head on the draft's device.
+            lm = self._tp_lm_head()
+        else:
+            ll = self.attached_model().logit_layer_idx
+            lm = self.attached_model().modules[ll]
         logits = lm.prepare_for_device(state.half(), params)
         logits = lm.forward(logits, params)
         logits = logits[..., :self.attached_model().config.vocab_size]
@@ -190,6 +192,26 @@ class DFlash2Model(DFlashModel):
         out[:, 0] = anchor
         out[:, 1:] = path
         return out
+
+    def _tp_lm_head(self):
+        lm = getattr(self, "_tp_lm_head_module", None)
+        if lm is None:
+            from ..modules import Linear
+            target = self.attached_model()
+            ref = target.modules[target.logit_layer_idx]
+            lm = Linear(
+                config = target.config,
+                key = ref.key,
+                qbits_key = ref.qbits_key,
+                alt_key = ref.alt_key,
+                in_features = ref.in_features_unpadded,
+                out_features = ref.out_features_unpadded,
+                qmap = "block",
+                caps = {"logits_output": True},
+            )
+            lm.load(self.selector.device)
+            self._tp_lm_head_module = lm
+        return lm
 
     @classmethod
     @override
