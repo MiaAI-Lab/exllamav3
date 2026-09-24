@@ -96,19 +96,29 @@ def build_model(argv, use_draft = True):
     parser = ArgumentParser()
     model_init.add_args(parser, add_draft_model_args = use_draft)
     args = parser.parse_args(argv)
+    # Second-tier caches in system RAM (model_init takes GB, Generator bytes).
+    # cpu_cache_size: evicted KV pages, restored on prompt-cache hits instead of
+    # re-prefilling. recurrent_cache_size: recurrent-state checkpoints (hybrid
+    # models); a restored KV page is only reusable if a checkpoint for that
+    # prefix survives. -ccs used to be parsed but never reached the Generator.
+    tier_kwargs = {
+        "cpu_cache_size": int(args.cpu_cache_size * 1024**3),
+        "recurrent_cache_size": int(args.recurrent_cache_size * 1024**3),
+    }
     if use_draft:
         model, config, cache, tokenizer, draft_model, draft_config, draft_cache = \
             model_init.init(args, progress = True)
         generator = Generator(
             model, cache, tokenizer,
             draft_model = draft_model, draft_cache = draft_cache,
+            **tier_kwargs,
             # num_draft_tokens defaults to the draft model's arch-declared
             # default_draft_size (DFlash2: block_size - 1 = 7, MTP: 4). Must
             # match model_init's max_history sizing, which reads the same caps.
         )
     else:
         model, config, cache, tokenizer = model_init.init(args, progress = True)
-        generator = Generator(model, cache, tokenizer)
+        generator = Generator(model, cache, tokenizer, **tier_kwargs)
     return generator, tokenizer
 
 
@@ -584,7 +594,15 @@ def main():
                     help = "Draft model path, 'mtp' for MTP drafting (head inside the "
                            "main checkpoint: no extra weights, much smaller KV footprint) "
                            "or 'none' to disable drafting")
-    ap.add_argument("-gs", "--grid_size", type = int, default = 110)
+    ap.add_argument("-gs", "--grid_size", type = str, default = "110",
+                    help = "GPU memory budget in GB: one number, or a comma list "
+                           "per device (e.g. 22,22)")
+    ap.add_argument("-tpb", "--tp_backend", type = str, default = "native",
+                    choices = ["native", "nccl"],
+                    help = "tensor-parallel communication backend")
+    ap.add_argument("-tp", "--tensor_parallel", action = "store_true",
+                    help = "split the target model across all GPUs in --grid_size "
+                           "(tensor parallel); the draft model stays on one GPU")
     ap.add_argument("-cs", "--cache_size", type = int, default = 65536,
                     help = "KV cache size in tokens (default 65536; 8192 default "
                            "of model_init is too small for large tool sets)")
@@ -593,6 +611,9 @@ def main():
     ap.add_argument("-p", "--port", type = int, default = PORT)
     ap.add_argument("--host", type = str, default = "0.0.0.0",
                     help = "Interface to bind (use 127.0.0.1 for local-only)")
+    ap.add_argument("-rcs", "--recurrent_cache_size", type = float, default = 4.0,
+                    help = "GB of system RAM for recurrent-state checkpoints "
+                           "(hybrid models; engine default 4)")
     ap.add_argument("-ccs", "--cpu_cache_size", type = float, default = 0.0,
                     help = "CPU second-tier cache size in GB (pages spill from "
                            "GPU when the GPU cache is full)")
@@ -606,6 +627,10 @@ def main():
     use_draft = _draft not in ("none", "", "-")
     argv = ["-m", args.model,
             "-gs", str(args.grid_size), "-cs", str(args.cache_size)]
+    if args.tensor_parallel:
+        # DFlash2 and the CPU cache tier both support TP targets (this branch)
+        argv += ["-tp", "-tpb", args.tp_backend]
+    argv += ["-rcs", str(args.recurrent_cache_size)]
     if use_mtp:
         argv += ["-mtp"]
     elif use_draft:
