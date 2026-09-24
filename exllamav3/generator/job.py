@@ -1276,7 +1276,7 @@ class Job:
                             "block_table": seq.block_index_tensor,
                             "cache": self.generator.draft_cache,
                             "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
-                            "indexed_embeddings": self.embeddings if self.generator.mtp_draft else None,
+                            "indexed_embeddings": self.embeddings,
                         }
                     )
 

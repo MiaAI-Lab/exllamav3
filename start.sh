@@ -27,6 +27,8 @@ source .env
 # .env is sourced as shell vars; the model-download subprocess needs the HF
 # token in its environment, so export it if set.
 if [ -n "${HF_TOKEN:-}" ]; then export HF_TOKEN; fi
+# serve_openai.py reads the per-reply default cap from its environment.
+if [ -n "${DEFAULT_MAX_TOKENS:-}" ]; then export DEFAULT_MAX_TOKENS; fi
 
 # --- bootstrap: build the venv + install the engine on first run ----------
 # Re-enters if the venv is missing OR the install is incomplete (e.g. a
@@ -154,6 +156,14 @@ fi
 CACHE_QUANT="${CACHE_QUANT:-none}"
 CPU_CACHE_GB="${CPU_CACHE_GB:-0}"
 
+# --- vision (image input) -----------------------------------------------------
+# VISION=1 loads the checkpoint's vision component (costs VRAM) and lets chat
+# messages carry image parts. The limits below only apply when it is on.
+VISION="${VISION:-0}"
+MAX_IMAGE_MB="${MAX_IMAGE_MB:-20}"
+MAX_IMAGES_PER_REQUEST="${MAX_IMAGES_PER_REQUEST:-8}"
+IMAGE_FETCH_TIMEOUT="${IMAGE_FETCH_TIMEOUT:-15}"
+
 # --- speculative decoding method ---------------------------------------------
 # DRAFT = mtp | dflash2 | none (see .env.example for the trade-offs).
 # Legacy: DRAFT_DIR set to a path keeps working (= dflash2 with that path);
@@ -233,6 +243,12 @@ case "$DRAFT" in
 esac
 if [ "$CPU_CACHE_GB" != "0" ]; then
     cmd+=(--cpu_cache_size "$CPU_CACHE_GB")
+fi
+if [ "$VISION" = "1" ]; then
+    cmd+=(--vision
+          --max-image-mb "$MAX_IMAGE_MB"
+          --max-images "$MAX_IMAGES_PER_REQUEST"
+          --image-timeout "$IMAGE_FETCH_TIMEOUT")
 fi
 
 echo "Starting: ${cmd[*]}"
