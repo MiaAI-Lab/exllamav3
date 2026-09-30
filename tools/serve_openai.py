@@ -375,12 +375,22 @@ async def health(request):
         })
 
 
+def _present_int(body, key):
+    """An explicit integer, including 0. A missing key or null is absent."""
+    if key not in body or body[key] is None:
+        return None
+    return int(body[key])
+
+
 def parse_request(body):
     messages = body.get("messages")
     if not messages or not isinstance(messages, list):
         return None, "`messages` (list) is required"
-    max_tokens = int(body.get("max_tokens") or
-                     body.get("max_completion_tokens") or 1024)
+    max_tokens = _present_int(body, "max_tokens")
+    if max_tokens is None:
+        max_tokens = _present_int(body, "max_completion_tokens")
+    if max_tokens is None:
+        max_tokens = 1024
     temperature = float(body.get("temperature", 0.6))
     top_p = float(body.get("top_p", 0.95))
     top_k = int(body.get("top_k", 20))
